@@ -4,162 +4,250 @@
 //
 //  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
 //
+//  Greedy Algorithm
+//
 
+#include <cstdint>
 #include "Scheduler.hpp"
 
-static bool migrating = false;
-static unsigned active_machines = 16;
+#include <map>
+#include <set>
+#include <queue>
+#include <algorithm>
+
+struct MachineData {
+    MachineId_t machine_id;
+    unsigned memory_size;
+    unsigned num_cpus;
+    bool gpu;
+    
+    CPUType_t cpu_type;
+    MachineState_t s_state;
+
+    bool state_changing;
+    MachineState_t target_state;
+};
+
+vector<MachineData> machine_data;
+map<TaskId_t, VMId_t> task_to_vm;
+static queue<TaskId_t> pending_tasks;
+static set<TaskId_t> pending_set;
 
 void Scheduler::Init() {
-    // Find the parameters of the clusters
-    // Get the total number of machines
-    // For each machine:
-    //      Get the type of the machine
-    //      Get the memory of the machine
-    //      Get the number of CPUs
-    //      Get if there is a GPU or not
-    // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
-    for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+    SimOutput("Scheduler::Init(): Initializing scheduler", 3);
+    machine_data.resize(Machine_GetTotal());
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineData data;
+        MachineInfo_t info = Machine_GetInfo(i);
+        data.machine_id = info.machine_id;
+        data.memory_size = info.memory_size;
+        data.num_cpus = info.num_cpus;
+        data.gpu = info.gpus;
+
+        data.cpu_type = info.cpu;
+        data.s_state = info.s_state;
+        data.state_changing = false;
+        data.target_state = S0;
+
+        machines.push_back(info.machine_id);
+        machine_data[i] = data;
     }
-
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
-
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
+    if (task_to_vm.find(task_id) != task_to_vm.end()) return;
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    Priority_t priority = MID_PRIORITY;
+    if (task_info.required_sla == SLA0 || task_info.required_sla == SLA1) {
+        priority = HIGH_PRIORITY;
+    } else if (task_info.required_sla == SLA3) {
+        priority = LOW_PRIORITY;
     }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+
+    for (unsigned i = 0; i < vms.size(); i++) {
+        VMInfo_t vm_info = VM_GetInfo(vms[i]);
+        if (vm_info.cpu == task_info.required_cpu && vm_info.vm_type == task_info.required_vm) {
+            MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+
+            bool gpu_ok = !task_info.gpu_capable || machine_info.gpus;
+            bool mem_ok = machine_info.memory_used + task_info.required_memory <= machine_info.memory_size;
+            bool capacity_ok = false;
+
+            if (task_info.required_sla == SLA0) {
+                capacity_ok = machine_info.active_tasks + 1 < machine_info.num_cpus;
+            } else if (task_info.required_sla == SLA1) {
+                capacity_ok = machine_info.active_tasks < machine_info.num_cpus;
+            } else if (task_info.required_sla == SLA2) {
+                capacity_ok = machine_info.active_tasks <= machine_info.num_cpus;
+            } else {
+                capacity_ok = vm_info.active_tasks.size() < machine_info.num_cpus * 2;
+            }
+
+            if (machine_info.s_state == S0 && gpu_ok && mem_ok && capacity_ok) {
+                VM_AddTask(vms[i], task_id, priority);
+                task_to_vm[task_id] = vms[i];
+                return;
+            }
+        }
+    }
+
+    for (unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t info = Machine_GetInfo(machines[i]);
+
+        bool gpu_ok = !task_info.gpu_capable || info.gpus;
+        bool mem_ok = info.memory_used + task_info.required_memory + VM_MEMORY_OVERHEAD <= info.memory_size;
+        bool capacity_ok = false;
+
+        if (task_info.required_sla == SLA0) {
+            capacity_ok = info.active_tasks + 1 < info.num_cpus;
+        } else if (task_info.required_sla == SLA1) {
+            capacity_ok = info.active_tasks < info.num_cpus;
+        } else if (task_info.required_sla == SLA2) {
+            capacity_ok = info.active_tasks <= info.num_cpus;
+        } else {
+            capacity_ok = info.active_tasks < info.num_cpus * 2;
+        }
+
+        if (info.cpu == task_info.required_cpu && info.s_state == S0 && gpu_ok && mem_ok && capacity_ok) {
+            VMId_t vm_id = VM_Create(task_info.required_vm, task_info.required_cpu);
+            VM_Attach(vm_id, info.machine_id);
+            VM_AddTask(vm_id, task_id, priority);
+            task_to_vm[task_id] = vm_id;
+            vms.push_back(vm_id);
+            return;
+        }
+    }
+
+    if (pending_set.find(task_id) == pending_set.end()) {
+        pending_tasks.push(task_id);
+        pending_set.insert(task_id);
+    }
+
+    for (unsigned i = 0; i < machines.size(); i++) {
+        MachineInfo_t data = Machine_GetInfo(machines[i]);
+        if (data.cpu == task_info.required_cpu &&(!task_info.gpu_capable || data.gpus) && data.s_state != S0 && data.memory_used + task_info.required_memory + VM_MEMORY_OVERHEAD <= data.memory_size && !machine_data[i].state_changing) {
+            Machine_SetState(data.machine_id, S0);
+            machine_data[i].state_changing = true;
+            machine_data[i].target_state = S0;
+            return;
+        }
+    }
+
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    int pending_size = pending_tasks.size();
+    while (pending_size > 0 && !pending_tasks.empty()) {
+        pending_size--;
+        TaskId_t task_id = pending_tasks.front();
+        pending_tasks.pop();
+        pending_set.erase(task_id);
+        if (!IsTaskCompleted(task_id) && task_to_vm.find(task_id) == task_to_vm.end()) {
+            NewTask(now, task_id);
+        }
+    }
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    // Do your final reporting and bookkeeping here.
-    // Report about the total energy consumed
-    // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
-    for(auto & vm: vms) {
-        VM_Shutdown(vm);
+    for (unsigned i = 0; i < vms.size(); i++) {
+        VMInfo_t vm_info = VM_GetInfo(vms[i]);
+        if (vm_info.active_tasks.empty()) {
+            VM_Shutdown(vms[i]);
+        }
     }
+    vms.clear();
+
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    if (task_to_vm.find(task_id) == task_to_vm.end()) {
+        return;
+    }
+    VMId_t vm_id = task_to_vm[task_id];
+    task_to_vm.erase(task_id);
+
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    if (vm_info.active_tasks.empty()) {
+        VM_Shutdown(vm_id);
+        vms.erase(remove(vms.begin(), vms.end(), vm_id), vms.end());
+    }
+
+    SimOutput("TaskComplete(): task=" + to_string(task_id) + " completed at " + to_string(now), 3);
 }
 
 // Public interface below
 
-static Scheduler Scheduler;
+static Scheduler greed_scheduler;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
-    Scheduler.Init();
+    greed_scheduler.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
     SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
-    Scheduler.NewTask(time, task_id);
+    greed_scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
     SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
-    Scheduler.TaskComplete(time, task_id);
+    greed_scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // The simulator is alerting you that machine identified by machine_id is overcommitted
     SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
-    Scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
+    greed_scheduler.MigrationComplete(time, vm_id);
 }
 
 void SchedulerCheck(Time_t time) {
-    // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
-    Scheduler.PeriodicCheck(time);
-    static unsigned counts = 0;
-    counts++;
-    if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
+    greed_scheduler.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
-    // This function is called before the simulation terminates Add whatever you feel like.
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
     
-    Scheduler.Shutdown(time);
+    greed_scheduler.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    SetTaskPriority(task_id, HIGH_PRIORITY);
+
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    for (unsigned i = 0; i < machine_data.size(); i++) {
+        MachineInfo_t info = Machine_GetInfo(machine_data[i].machine_id);
+        if (info.cpu == task_info.required_cpu &&
+            (!task_info.gpu_capable || info.gpus) && info.s_state != S0 && info.memory_used + task_info.required_memory + VM_MEMORY_OVERHEAD <= info.memory_size && !machine_data[i].state_changing) {
+            Machine_SetState(info.machine_id, S0);
+            machine_data[i].state_changing = true;
+            machine_data[i].target_state = S0;
+            break;
+        }
+    }
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
+    for (unsigned i = 0; i < machine_data.size(); i++) {
+        if (machine_data[i].machine_id == machine_id) {
+            machine_data[i].state_changing = false;
+            machine_data[i].s_state = Machine_GetInfo(machine_id).s_state;
+            break;
+        }
+    }
 }
-
